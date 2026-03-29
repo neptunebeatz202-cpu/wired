@@ -1,0 +1,362 @@
+# ==============================================================================
+# Wired — macOS AU + VST3 Build & Installer
+# ==============================================================================
+#
+# Triggers:
+#   • Every push to main / master
+#   • Every pull request targeting main / master
+#   • Manual dispatch from the Actions tab (with optional version override)
+#
+# Outputs:
+#   • Wired-macOS-Installer.pkg   (AU + VST3 combined installer)
+#   • Wired-AU.zip                (raw AU bundle)
+#   • Wired-VST3.zip              (raw VST3 bundle)
+#
+# All three are uploaded as GitHub Actions artifacts, retained for 30 days.
+# ==============================================================================
+
+name: macOS AU + VST3 Installer
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string (e.g. 1.0.0) — cosmetic only, embedded in pkg'
+        required: false
+        default: '1.0.0'
+
+# Cancel any in-progress run for the same branch so pushes don't queue up
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Package (macOS)
+    runs-on: macos-14          # Apple Silicon runner
+
+    env:
+      JUCE_VERSION:   "7.0.9"
+      BUILD_TYPE:     Release
+      PLUGIN_VERSION: ${{ github.event.inputs.version || '1.0.0' }}
+
+    steps:
+    # --------------------------------------------------------------------------
+    # 1. Checkout
+    # --------------------------------------------------------------------------
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    # --------------------------------------------------------------------------
+    # 2. Cache JUCE source so repeated runs don't re-clone every time
+    # --------------------------------------------------------------------------
+    - name: Cache JUCE
+      id: cache-juce
+      uses: actions/cache@v4
+      with:
+        path: JUCE
+        key: juce-${{ env.JUCE_VERSION }}
+
+    - name: Clone JUCE (if not cached)
+      if: steps.cache-juce.outputs.cache-hit != 'true'
+      run: |
+        git clone --depth 1 --branch ${{ env.JUCE_VERSION }} \
+          https://github.com/juce-framework/JUCE.git JUCE
+
+    # --------------------------------------------------------------------------
+    # 3. Install build tools
+    # --------------------------------------------------------------------------
+    - name: Install Ninja
+      run: brew install ninja
+
+    # --------------------------------------------------------------------------
+    # 4. Verify project structure before CMake runs
+    # --------------------------------------------------------------------------
+    - name: Verify source files exist
+      run: |
+        echo "=== Checking required source files ==="
+        required=(
+          "PluginProcessor.h"
+          "PluginProcessor.cpp"
+          "PluginEditor.h"
+          "PluginEditor.cpp"
+          "CMakeLists.txt"
+        )
+        missing=0
+        for f in "${required[@]}"; do
+          if [ -f "$f" ]; then
+            echo "  ✓  $f"
+          else
+            echo "  ✗  MISSING: $f"
+            missing=$((missing + 1))
+          fi
+        done
+        if [ $missing -gt 0 ]; then
+          echo ""
+          echo "ERROR: $missing required file(s) missing. Aborting build."
+          exit 1
+        fi
+        echo ""
+        echo "All required files present."
+
+    - name: Verify GIF resource exists
+      run: |
+        echo "=== Checking resources ==="
+        if [ -f "resources/lain.gif" ]; then
+          echo "  ✓  resources/lain.gif ($(du -sh resources/lain.gif | cut -f1))"
+        else
+          echo "  ✗  MISSING: resources/lain.gif"
+          echo ""
+          echo "ERROR: The GIF resource is required for BinaryData generation."
+          echo "Place lain.gif in the resources/ folder before building."
+          exit 1
+        fi
+
+    # --------------------------------------------------------------------------
+    # 5. CMake configure
+    #    Universal Binary: arm64 + x86_64
+    #    Deployment target 11.0 — required for AU on Apple Silicon
+    # --------------------------------------------------------------------------
+    - name: Configure CMake
+      run: |
+        cmake -B build -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0" \
+          -Wno-dev
+
+    # --------------------------------------------------------------------------
+    # 6. Build
+    # --------------------------------------------------------------------------
+    - name: Build (Release)
+      run: |
+        cmake --build build \
+          --config ${{ env.BUILD_TYPE }} \
+          --parallel $(sysctl -n hw.logicalcpu)
+
+    # --------------------------------------------------------------------------
+    # 7. Verify build outputs
+    # --------------------------------------------------------------------------
+    - name: Verify build artifacts
+      run: |
+        echo "=== Verifying build outputs ==="
+
+        AU_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/AU/Wired.component"
+        VST_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/VST3/Wired.vst3"
+
+        fail=0
+
+        if [ -d "$AU_PATH" ]; then
+          echo "  ✓  AU:   $AU_PATH"
+          echo "     Size: $(du -sh "$AU_PATH" | cut -f1)"
+        else
+          echo "  ✗  AU MISSING: $AU_PATH"
+          fail=1
+        fi
+
+        if [ -d "$VST_PATH" ]; then
+          echo "  ✓  VST3: $VST_PATH"
+          echo "     Size: $(du -sh "$VST_PATH" | cut -f1)"
+        else
+          echo "  ✗  VST3 MISSING: $VST_PATH"
+          fail=1
+        fi
+
+        AU_BIN="$AU_PATH/Contents/MacOS/Wired"
+        VST_BIN="$VST_PATH/Contents/MacOS/Wired"
+
+        for bin in "$AU_BIN" "$VST_BIN"; do
+          if [ -f "$bin" ]; then
+            size=$(stat -f%z "$bin")
+            if [ "$size" -gt 0 ]; then
+              echo "  ✓  Binary OK: $bin ($size bytes)"
+            else
+              echo "  ✗  Binary is ZERO BYTES: $bin"
+              fail=1
+            fi
+          else
+            echo "  ✗  Binary not found: $bin"
+            fail=1
+          fi
+        done
+
+        if [ $fail -ne 0 ]; then
+          echo ""
+          echo "ERROR: One or more build outputs are missing or empty."
+          exit 1
+        fi
+
+        echo ""
+        echo "All build outputs verified."
+
+    # --------------------------------------------------------------------------
+    # 8. Ad-hoc code sign
+    #    Required for macOS Ventura+ — without signing, DAWs quarantine the
+    #    plugins. Ad-hoc signing ('-') works for local/personal use with no
+    #    Apple Developer certificate required.
+    #    For distribution, replace '-' with your Developer ID Application cert.
+    # --------------------------------------------------------------------------
+    - name: Ad-hoc sign plugins
+      run: |
+        AU_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/AU/Wired.component"
+        VST_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/VST3/Wired.vst3"
+
+        echo "Signing AU..."
+        codesign --force --deep --sign - "$AU_PATH" 2>&1 || true
+
+        echo "Signing VST3..."
+        codesign --force --deep --sign - "$VST_PATH" 2>&1 || true
+
+        echo "Verifying signatures..."
+        codesign --verify --deep --strict "$AU_PATH"  && echo "  ✓  AU signature valid"
+        codesign --verify --deep --strict "$VST_PATH" && echo "  ✓  VST3 signature valid"
+
+    # --------------------------------------------------------------------------
+    # 9. Verify Universal Binary (arm64 + x86_64 slices present)
+    # --------------------------------------------------------------------------
+    - name: Verify Universal Binary
+      run: |
+        AU_BIN="build/Wired_artefacts/${{ env.BUILD_TYPE }}/AU/Wired.component/Contents/MacOS/Wired"
+        VST_BIN="build/Wired_artefacts/${{ env.BUILD_TYPE }}/VST3/Wired.vst3/Contents/MacOS/Wired"
+
+        for bin in "$AU_BIN" "$VST_BIN"; do
+          echo "Architectures in $(basename $(dirname $bin)):"
+          lipo -info "$bin"
+          lipo -info "$bin" | grep -q "arm64"  || { echo "ERROR: arm64 slice missing in $bin";  exit 1; }
+          lipo -info "$bin" | grep -q "x86_64" || { echo "ERROR: x86_64 slice missing in $bin"; exit 1; }
+        done
+        echo "Universal Binary check passed."
+
+    # --------------------------------------------------------------------------
+    # 10. Build macOS installer package (.pkg)
+    #     Installs both plugins to standard system locations:
+    #       AU   → /Library/Audio/Plug-Ins/Components/
+    #       VST3 → /Library/Audio/Plug-Ins/VST3/
+    # --------------------------------------------------------------------------
+    - name: Build installer package
+      run: |
+        AU_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/AU/Wired.component"
+        VST_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/VST3/Wired.vst3"
+        VER="${{ env.PLUGIN_VERSION }}"
+
+        # Stage bundles in an install-root mirroring the target filesystem
+        mkdir -p pkg_root/Library/Audio/Plug-Ins/Components
+        mkdir -p pkg_root/Library/Audio/Plug-Ins/VST3
+
+        cp -R "$AU_PATH"  pkg_root/Library/Audio/Plug-Ins/Components/
+        cp -R "$VST_PATH" pkg_root/Library/Audio/Plug-Ins/VST3/
+
+        echo "Staged package root:"
+        find pkg_root -type f | sort
+
+        # Build component package
+        pkgbuild \
+          --root pkg_root \
+          --identifier "com.wireddev.wired" \
+          --version "$VER" \
+          --install-location "/" \
+          Wired-component.pkg
+
+        # Build distribution wrapper with installer UI
+        cat > distribution.xml << EOF
+        <?xml version="1.0" encoding="utf-8"?>
+        <installer-gui-script minSpecVersion="2">
+            <title>Wired $VER</title>
+            <options customize="never" require-scripts="false" rootVolumeOnly="true"/>
+            <pkg-ref id="com.wireddev.wired"/>
+            <choices-outline>
+                <line choice="com.wireddev.wired"/>
+            </choices-outline>
+            <choice id="com.wireddev.wired"
+                    visible="false"
+                    title="Wired">
+                <pkg-ref id="com.wireddev.wired"/>
+            </choice>
+            <pkg-ref id="com.wireddev.wired"
+                     version="$VER"
+                     onConclusion="none">Wired-component.pkg</pkg-ref>
+        </installer-gui-script>
+        EOF
+
+        productbuild \
+          --distribution distribution.xml \
+          --package-path . \
+          Wired-macOS-Installer.pkg
+
+        echo ""
+        echo "Installer built:"
+        ls -lh Wired-macOS-Installer.pkg
+
+    # --------------------------------------------------------------------------
+    # 11. Zip raw plugin bundles for drag-and-drop install
+    # --------------------------------------------------------------------------
+    - name: Zip raw plugin bundles
+      run: |
+        AU_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/AU/Wired.component"
+        VST_PATH="build/Wired_artefacts/${{ env.BUILD_TYPE }}/VST3/Wired.vst3"
+
+        cd "$(dirname "$AU_PATH")"
+        zip -r "$GITHUB_WORKSPACE/Wired-AU.zip" Wired.component
+        cd "$GITHUB_WORKSPACE"
+
+        cd "$(dirname "$VST_PATH")"
+        zip -r "$GITHUB_WORKSPACE/Wired-VST3.zip" Wired.vst3
+        cd "$GITHUB_WORKSPACE"
+
+        echo "Zipped bundles:"
+        ls -lh Wired-AU.zip Wired-VST3.zip
+
+    # --------------------------------------------------------------------------
+    # 12. Upload all artifacts
+    # --------------------------------------------------------------------------
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: Wired-macOS-Installer
+        path: Wired-macOS-Installer.pkg
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Upload AU bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: Wired-AU
+        path: Wired-AU.zip
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Upload VST3 bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: Wired-VST3
+        path: Wired-VST3.zip
+        retention-days: 30
+        if-no-files-found: error
+
+    # --------------------------------------------------------------------------
+    # 13. Build summary visible in the GitHub Actions UI
+    # --------------------------------------------------------------------------
+    - name: Build summary
+      if: always()
+      run: |
+        echo "## Wired Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | ${{ env.PLUGIN_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| JUCE | ${{ env.JUCE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Runner | macos-14 (Apple Silicon) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Architectures | arm64 + x86_64 (Universal) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+        echo "- \`Wired-macOS-Installer.pkg\` — double-click installer (AU + VST3)" >> $GITHUB_STEP_SUMMARY
+        echo "- \`Wired-AU.zip\` — raw AU bundle for manual install" >> $GITHUB_STEP_SUMMARY
+        echo "- \`Wired-VST3.zip\` — raw VST3 bundle for manual install" >> $GITHUB_STEP_SUMMARY
